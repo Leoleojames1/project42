@@ -1,0 +1,5 @@
+timestamp,source,content,conversation_id
+2025-03-31 18:36:34.794407,user,hey,9332186c-ee73-401d-97c7-c2b7c028c3e1
+2025-03-31 18:36:56.918699,assistant,"Hello! How can I assist you today? Whether it's answering questions, providing information, or helping with a task, I'm here to help. Just let me know what you need!",9332186c-ee73-401d-97c7-c2b7c028c3e1
+2025-03-31 20:16:42.096892,user,hi,863a742a-b9b5-44b8-9784-386fe1d80d70
+2025-03-31 20:16:52.392111,assistant,Hello! How can I help you today?,863a742a-b9b5-44b8-9784-386fe1d80d70

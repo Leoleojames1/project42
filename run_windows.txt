@@ -1,0 +1,32 @@
+@echo off
+echo 🚀 Starting Project 42 Speech Assistant...
+
+:: Check if virtual environment exists
+if exist venv (
+    echo 📦 Activating virtual environment...
+    call venv\Scripts\activate
+) else (
+    echo 🔧 Creating virtual environment...
+    python -m venv venv
+    call venv\Scripts\activate
+    
+    echo 📦 Installing requirements...
+    pip install -r requirements.txt
+)
+
+:: Check if Ollama is running
+echo 🔍 Checking if Ollama is running...
+curl -s http://localhost:11434/api/tags > nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo ⚠️ Ollama seems to be not running. Please start Ollama first.
+    echo You can start Ollama by running 'ollama serve' in another terminal.
+    pause
+    echo ⏳ Continuing anyway...
+)
+
+:: Start the application
+echo ✨ Launching Project 42...
+python main.py
+
+:: Deactivate virtual environment when done
+call deactivate
