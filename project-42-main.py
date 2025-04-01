@@ -507,6 +507,8 @@ class SpeechWorker(QThread):
     
     update_signal = pyqtSignal(str, str)  # (type, content)
     finished_signal = pyqtSignal()
+    stt_audio_signal = pyqtSignal(np.ndarray)  # Audio input samples
+    tts_audio_signal = pyqtSignal(np.ndarray)  # Audio output samples
     
     def __init__(self, stt, tts, ollama_client, model_name):
         super().__init__()
@@ -531,120 +533,111 @@ class SpeechWorker(QThread):
         while self.running:
             # Initial wake word to start conversation mode
             if not self.in_conversation:
-                if not self.stt.wait_for_wake_word():
+                wake_word_detected = self.stt.wait_for_wake_word()
+                if wake_word_detected:
+                    self.in_conversation = True
+                    self.update_signal.emit("status", "Wake word detected! Listening...")
+                else:
+                    # If we're not running anymore, exit
                     if not self.running:
                         break
                     continue
-                
-                # Enter conversation mode
-                self.in_conversation = True
-                self.update_signal.emit("status", "Conversation started! Listening...")
-                self.tts.speak_text("I'm listening", wait_for_completion=False)  # Non-blocking
             
             # In conversation mode: continuously listen and respond
             while self.in_conversation and self.running:
-                # Listen for user input with non-blocking approach
+                # Listen for user speech
                 self.update_signal.emit("status", "Listening...")
-                user_input = self.stt.start_listening_session(non_blocking=True)
                 
-                if not user_input or not user_input.strip():
-                    # No clear speech detected, keep trying
+                # Start listening but show interim results
+                self.live_listening_active = True
+                
+                # Start background listening thread to show live results
+                live_thread = threading.Thread(target=self.live_transcription_preview)
+                live_thread.daemon = True
+                live_thread.start()
+                
+                # Do the actual listening
+                speech_text = self.stt.start_listening_session(non_blocking=False)
+                
+                # Stop live preview
+                self.live_listening_active = False
+                
+                # If speech was interrupted, reset and continue
+                if self.stt.speech_interrupted:
+                    self.stt.speech_interrupted = False
+                    self.update_signal.emit("status", "Speech interrupted. Listening again...")
                     continue
-                
-                # Check for exit commands
-                if any(phrase in user_input.lower() for phrase in ["exit conversation", "end conversation", "stop conversation"]):
-                    self.update_signal.emit("status", "Ending conversation...")
-                    self.tts.speak_text("Ending our conversation. Say the wake word when you want to chat again.")
-                    self.in_conversation = False
+                    
+                # Process recognized speech
+                if speech_text and speech_text.strip() != "":
+                    # Update UI with recognized text
+                    self.update_signal.emit("user", speech_text)
+                    self.update_signal.emit("status", "Processing your request...")
+                    
+                    # Start thinking mode
+                    self.thinking = True
+                    
+                    try:
+                        # Prepare messages for LLM
+                        messages = [
+                            {"role": "user", "content": speech_text}
+                        ]
+                        
+                        # Generate LLM response with streaming
+                        self.update_signal.emit("status", "Assistant is thinking...")
+                        self.response_buffer = ""
+                        
+                        # Get streaming response
+                        stream = self.ollama_client.chat(
+                            self.model_name,
+                            messages,
+                            stream=True
+                        )
+                        
+                        # Process streaming chunks
+                        full_response = ""
+                        for chunk in stream:
+                            if not self.thinking or not self.running:
+                                break
+                                
+                            if 'message' in chunk and 'content' in chunk['message']:
+                                response_text = chunk['message']['content']
+                                full_response += response_text
+                                self.response_buffer += response_text
+                                
+                                # Emit streaming update
+                                self.update_signal.emit("assistant_stream", response_text)
+                                
+                                # Create audio in the background for smoother interaction
+                                if self.detect_sentence_boundary(self.response_buffer):
+                                    # Speak the buffered text
+                                    self.tts.speak_text(self.response_buffer)
+                                    self.response_buffer = ""
+                        
+                        # Emit the complete response once done
+                        if full_response and self.running:
+                            self.update_signal.emit("assistant", full_response)
+                        
+                    except Exception as e:
+                        self.update_signal.emit("error", f"Error generating response: {str(e)}")
+                    finally:
+                        # Clear thinking state
+                        self.thinking = False
+                else:
+                    self.update_signal.emit("status", "Didn't catch that. Try again?")
+                        
+                # Check for exit conditions
+                if not self.running:
                     break
-                
-                # Process normal input
-                self.update_signal.emit("user", user_input)
-                self.update_signal.emit("status", "Processing your request...")
-                
-                # Add user message to context
-                self.messages.append({"role": "user", "content": user_input})
-                
-                # Prepare for streaming response
-                self.update_signal.emit("status", "Thinking...")
-                self.thinking = True
-                self.response_buffer = ""
-                
-                # Get response from Ollama with streaming
-                try:
-                    stream = ollama.chat(
-                        model=self.model_name,
-                        messages=self.messages,
-                        stream=True
-                    )
-                    
-                    sentence_buffer = ""
-                    full_response = ""
-                    last_chunk_time = time.time()
-                    sentence_complete = False
-                    
-                    # Process streaming response with parallel TTS generation
-                    for chunk in stream:
-                        if not self.running or not self.in_conversation:
-                            break
-                            
-                        if self.stt.speech_interrupted:
-                            print("Response generation interrupted by wake word")
-                            self.stt.speech_interrupted = False
-                            break
-                            
-                        if 'message' in chunk:
-                            content = chunk['message']['content']
-                            sentence_buffer += content
-                            full_response += content
-                            self.update_signal.emit("assistant_stream", content)
-                            
-                            # Check if we have sentence terminators
-                            if any(char in content for char in '.!?:'):
-                                sentence_complete = True
-                            
-                            # Process in sentence chunks for more natural speech
-                            current_time = time.time()
-                            chunk_interval = current_time - last_chunk_time
-                            
-                            # Send to TTS if we have a complete sentence or enough content
-                            if (sentence_complete or len(sentence_buffer) > 50 or chunk_interval > 0.8) and sentence_buffer.strip():
-                                # We have a chunk to process - speak it
-                                self.update_signal.emit("status", "Speaking while continuing to think...")
-                                
-                                # Speak this chunk without waiting for completion
-                                print(f"Processing TTS chunk: {sentence_buffer[:30]}...")
-                                self.tts.speak_text(sentence_buffer, wait_for_completion=False)
-                                
-                                # Reset for next chunk
-                                sentence_buffer = ""
-                                sentence_complete = False
-                                last_chunk_time = current_time
-                    
-                    # Process any remaining text
-                    if sentence_buffer.strip():
-                        self.tts.speak_text(sentence_buffer, wait_for_completion=False)
-                    
-                    # Add complete response to context
-                    if full_response:
-                        self.messages.append({"role": "assistant", "content": full_response})
-                        self.update_signal.emit("assistant", full_response)
-                        
-                    # Wait for TTS to finish
-                    while self.tts.is_speaking() and not self.stt.speech_interrupted:
-                        time.sleep(0.1)
-                        
-                    self.thinking = False
-                    
-                except Exception as e:
-                    error_msg = f"Error: {str(e)}"
-                    self.update_signal.emit("error", error_msg)
-                    self.tts.speak_text("Sorry, I encountered an error while processing your request.")
-                    self.thinking = False
             
             # Reset for the next conversation cycle
             if not self.in_conversation:
-                self.update_signal.emit("status", "Waiting for wake word to start conversation...")
+                self.update_signal.emit("status", "Waiting for wake word...")
+            
+            # Add this to emit input audio samples periodically
+            if hasattr(self, "stt") and hasattr(self.stt, "samples_buffer") and len(self.stt.samples_buffer) > 0:
+                input_samples = np.array(self.stt.samples_buffer)
+                self.stt_audio_signal.emit(input_samples)
         
         self.finished_signal.emit()
         
@@ -725,8 +718,40 @@ class SpeechWorker(QThread):
         ]
         has_clause = any(cm in text for cm in clause_markers)
         
-        # Return true if we have a terminator that's not just a trailing comma
-        return has_terminator or has_quote_end or bool(list_markers) or has_clause
+        # Add this after detecting a sentence boundary:
+        if has_terminator or has_quote_end:
+            if hasattr(self.tts, "speak_text") and self.tts:
+                # This sentence is complete, speak it and show visualization
+                self.tts.speak_text(self.response_buffer)
+                self.visualize_tts_chunk(self.response_buffer)
+                self.response_buffer = ""
+                return True
+        
+        return False
+
+    def visualize_tts_chunk(self, text):
+        """Show visual indicator for TTS chunk processing"""
+        # Create a pulse pattern for the output visualizer based on text length
+        chunk_length = len(text)
+        pulse_intensity = min(1.0, chunk_length / 100.0) * 0.8 + 0.2  # Scale between 0.2-1.0
+        
+        # Generate sample pattern
+        pulse_pattern = np.sin(np.linspace(0, np.pi*2, 100)) * pulse_intensity
+        
+        # Use signal instead of direct access - this was causing issues
+        self.tts_audio_signal.emit(pulse_pattern)
+        
+        # Send status update instead of direct UI manipulation
+        status_message = f"Speaking: {text[:30]}..."
+        self.update_signal.emit("status", status_message)
+
+    def live_transcription_preview(self):
+        """Show live transcription preview as audio is processed"""
+        while self.live_listening_active and hasattr(self.stt, "current_partial_result"):
+            if hasattr(self.stt, "current_partial_result") and self.stt.current_partial_result:
+                # Send partial result to UI
+                self.update_signal.emit("partial_transcript", self.stt.current_partial_result)
+            time.sleep(0.1)
 
 
 class MainWindow(QMainWindow):
@@ -756,6 +781,8 @@ class MainWindow(QMainWindow):
         
         # Load conversations
         self.load_conversation_list()
+        
+        self.debug_mode = True  # Set to False in production
         
     def init_ui(self):
         """Initialize UI components"""
@@ -901,8 +928,8 @@ class MainWindow(QMainWindow):
         # After adding control panel to main layout
         # Add audio visualizers
         visualizer_panel = QWidget()
-        visualizer_layout = QHBoxLayout(visualizer_panel)
-        visualizer_layout.setContentsMargins(10, 5, 10, 5)
+        self.audio_layout = QHBoxLayout(visualizer_panel)  # Define audio_layout as a class attribute
+        self.audio_layout.setContentsMargins(10, 5, 10, 5)
         
         # Input visualizer
         input_visualizer_widget = QWidget()
@@ -923,8 +950,8 @@ class MainWindow(QMainWindow):
         output_visualizer_layout.addWidget(self.output_visualizer)
         
         # Add to visualizer panel
-        visualizer_layout.addWidget(input_visualizer_widget)
-        visualizer_layout.addWidget(output_visualizer_widget)
+        self.audio_layout.addWidget(input_visualizer_widget)
+        self.audio_layout.addWidget(output_visualizer_widget)
         
         # Add visualizers to main layout
         main_layout.addWidget(visualizer_panel)
@@ -934,48 +961,76 @@ class MainWindow(QMainWindow):
         self.visualizer_timer.timeout.connect(self.update_visualizers)
         self.visualizer_timer.start(50)  # Update every 50ms
         
+        # Add a status bar for important notifications
+        self.statusBar().showMessage("Ready - Say the wake word to begin")
+        
+        # Add this line near the end of init_ui
+        self.stt.wake_word = "Alexa"  # Make sure wake word is explicitly set
+        
+        # Add the audio visualizers to the UI
+
+        def init_ui(self):
+            # After adding control panel to main layout
+            # Add audio visualizers
+            visualizer_panel = QWidget()
+            self.audio_layout = QVBoxLayout(visualizer_panel)
+            self.audio_layout.setContentsMargins(10, 5, 10, 5)
+            
+            # Create input/output visualizer headers
+            header_layout = QHBoxLayout()
+            
+            # Input side
+            input_label = QLabel("Voice Input")
+            input_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            header_layout.addWidget(input_label)
+            
+            # Output side
+            output_label = QLabel("Speech Output")
+            output_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            header_layout.addWidget(output_label)
+            
+            self.audio_layout.addLayout(header_layout)
+            
+            # Create visualizer container
+            visualizer_container = QHBoxLayout()
+            
+            # Create input visualizer
+            self.input_visualizer = AudioWaveformVisualizer(mode="input")
+            self.input_visualizer.setMinimumHeight(80)
+            visualizer_container.addWidget(self.input_visualizer)
+            
+            # Create output visualizer
+            self.output_visualizer = AudioWaveformVisualizer(mode="output")
+            self.output_visualizer.setMinimumHeight(80)
+            visualizer_container.addWidget(self.output_visualizer)
+            
+            self.audio_layout.addLayout(visualizer_container)
+            
+            # Add visualizer panel to main layout
+            main_layout.addWidget(visualizer_panel)
+            
+            # Start update timer for visualizers
+            self.visualizer_timer = QTimer(self)
+            self.visualizer_timer.timeout.connect(self.update_visualizers)
+            self.visualizer_timer.start(50)  # Update every 50ms
+        
     def refresh_models(self):
         """Refresh available Ollama models"""
         self.model_combo.clear()
-        models = self.ollama_client.get_available_models()
         
-        if not models:
-            self.status_display.setText("No models found. Is Ollama running?")
-            return
-            
-        for model in models:
-            self.model_combo.addItem(model)
-            
-        self.status_display.setText(f"Found {len(models)} models")
-        
-    def start_assistant(self):
-        """Start the speech assistant"""
-        if not self.model_combo.currentText():
-            self.status_display.setText("Please select a model first")
-            return
-            
-        model_name = self.model_combo.currentText()
-        
-        # Update UI
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.refresh_button.setEnabled(False)
-        self.model_combo.setEnabled(False)
-        
-        # Clear output display
-        self.output_display.clear()
-        self.status_display.setText(f"Starting assistant with model: {model_name}")
-        
-        # Start worker thread
-        self.speech_worker = SpeechWorker(
-            self.stt, 
-            self.tts,
-            self.ollama_client,
-            model_name
-        )
-        self.speech_worker.update_signal.connect(self.update_from_worker)
-        self.speech_worker.finished_signal.connect(self.worker_finished)
-        self.speech_worker.start()
+        # Instead of using speech_worker (which might be None), 
+        # use the ollama_client directly
+        try:
+            models = self.ollama_client.get_available_models()
+            if models:
+                for model in models:
+                    self.model_combo.addItem(model)
+                self.status_display.setText(f"Found {len(models)} models")
+            else:
+                self.status_display.setText("No models found. Is Ollama running?")
+        except Exception as e:
+            self.status_display.setText(f"Error loading models: {e}")
+            print(f"Error loading models: {e}")
         
     def stop_assistant(self):
         """Stop the speech assistant"""
@@ -994,36 +1049,75 @@ class MainWindow(QMainWindow):
         self.status_display.setText("Assistant stopped")
         
     def update_from_worker(self, update_type, content):
-        """Handle updates from worker thread"""
-        print(f"Worker update: {update_type} - {content[:50]}...")  # Debug print
+        """Update UI based on worker signals"""
+        
+        # Add this case for partial transcription
+        if update_type == "partial_transcript":
+            # Show partial transcript in status bar with different style
+            self.status_display.setText(f"Recognizing: {content}")
+            self.statusBar().showMessage(f"Hearing: {content}", 1000)
         
         if update_type == "status":
             self.status_display.setText(content)
+            self.statusBar().showMessage(content, 3000)  # Show in status bar for 3 seconds
+            
         elif update_type == "user":
-            # Add user message to conversation display
-            self.conversation_display.append(f"<b>You:</b> {content}")
-            # Add to conversation manager
+            # Format and display user speech
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            formatted_text = f"<p><span style='color: #66CDAA;'>[{timestamp}] <b>You:</b></span> {content}</p>"
+            self.output_display.append(formatted_text)
+            self.conversation_display.append(formatted_text)
+            
+            # Add to conversation history
             self.conversation_manager.add_message("user", content)
-        elif update_type == "assistant_stream":
-            # Update live output display
-            current_text = self.output_display.toPlainText()
-            self.output_display.setText(current_text + content)
-            # Make sure to scroll to the bottom
-            self.output_display.verticalScrollBar().setValue(
-                self.output_display.verticalScrollBar().maximum())
+            
         elif update_type == "assistant":
-            # Add complete assistant message to conversation display
-            self.conversation_display.append(f"<b>Assistant:</b> {content}")
-            # Make sure to scroll to the bottom
-            self.conversation_display.verticalScrollBar().setValue(
-                self.conversation_display.verticalScrollBar().maximum())
-            # Add to conversation manager
+            # Format and display complete assistant response
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            formatted_text = f"<p><span style='color: #9370DB;'>[{timestamp}] <b>Assistant:</b></span> {content}</p>"
+            
+            # Replace any existing streaming response with the complete one
+            self.replace_streaming_response(formatted_text)
+            self.conversation_display.append(formatted_text)
+            
+            # Add to conversation history
             self.conversation_manager.add_message("assistant", content)
-            # Clear streaming output
-            self.output_display.clear()
+            
+        elif update_type == "assistant_stream":
+            # For streaming updates, continuously update the current assistant response
+            self.update_streaming_response(content)
+            
         elif update_type == "error":
-            self.status_display.setText("Error")
-            self.output_display.append(f"<span style='color:red'>{content}</span>")
+            # Show errors in red
+            self.output_display.append(f"<p style='color: #ff6666;'><b>Error:</b> {content}</p>")
+            self.status_display.setText(f"Error: {content}")
+
+    def update_streaming_response(self, new_content):
+        """Update the streaming response in real-time"""
+        # Get current content
+        html = self.output_display.toHtml()
+        
+        # Check if we already have a streaming message
+        if "<span class='streaming'>" in html:
+            # Update existing streaming message
+            html = html.split("<span class='streaming'>")[0] + "<span class='streaming'>" + new_content + "</span>"
+            self.output_display.setHtml(html)
+        else:
+            # Add new streaming message
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.output_display.append(f"<p><span style='color: #9370DB;'>[{timestamp}] <b>Assistant:</b></span> <span class='streaming'>{new_content}</span></p>")
+
+    def replace_streaming_response(self, complete_response):
+        """Replace streaming response with complete response"""
+        html = self.output_display.toHtml()
+        if "<span class='streaming'>" in html:
+            parts = html.split("<span class='streaming'>")
+            before = parts[0]
+            after = parts[1].split("</span>", 1)[1] if "</span>" in parts[1] else ""
+            self.output_display.setHtml(before + complete_response + after)
+        else:
+            # Fallback if no streaming response found
+            self.output_display.append(complete_response)
             
     def new_conversation(self):
         """Start a new conversation"""
@@ -1324,21 +1418,49 @@ class MainWindow(QMainWindow):
             # Process next sentence while current one is playing
             audio_futures.append(self.executor.submit(self.generate_sentence_audio, sentence))
 
+    # Fix in update_visualizers method
     def update_visualizers(self):
-        """Update audio visualizers with current samples"""
-        # Update input visualizer
-        if hasattr(self, 'stt') and hasattr(self.stt, 'get_audio_samples'):
-            samples = self.stt.get_audio_samples()
-            if len(samples) > 0:
-                self.input_visualizer.update_samples(samples)
+        """Update audio visualizers with latest samples"""
+        # If speech worker is active and we have a speech-to-text instance
+        if hasattr(self, "stt") and self.stt:
+            # Get audio samples from STT
+            if hasattr(self.stt, "samples_buffer"):  # Fixed attribute check
+                input_samples = self.stt.get_audio_samples()
+                if len(input_samples) > 0:
+                    self.input_visualizer.update_samples(input_samples)
+                    
+                    # Show recognized speech status in real time
+                    if hasattr(self.stt, "in_speech") and self.stt.in_speech:
+                        avg_level = np.mean(input_samples)
+                        if avg_level > 0.1:  # Only show for significant sound
+                            self.status_display.setText("Listening: Speech detected...")
         
-        # Update output visualizer
-        if hasattr(self, 'tts') and hasattr(self.tts, 'get_audio_samples'):
-            samples = self.tts.get_audio_samples()
-            if len(samples) > 0:
-                self.output_visualizer.update_samples(samples)
+        # If we have text-to-speech instance
+        if hasattr(self, "tts") and self.tts:
+            # Get audio samples from TTS
+            if hasattr(self.tts, "get_audio_samples"):
+                output_samples = self.tts.get_audio_samples()
+                if output_samples is not None and len(output_samples) > 0:
+                    self.output_visualizer.update_samples(output_samples)
+                    
+                    # Show TTS active status
+                    if self.tts.is_playing:
+                        self.status_display.setText("Speaking...")
 
-    # Add this method to the MainWindow class
+        # Add detailed status display 
+        if hasattr(self, "stt") and self.stt:
+            if hasattr(self.stt, "samples_buffer"):  # Fixed attribute check
+                samples_buffer = self.stt.samples_buffer
+                if len(samples_buffer) > 0:
+                    avg_level = np.mean(samples_buffer)
+                    max_level = np.max(samples_buffer) if len(samples_buffer) > 0 else 0
+                    
+                    # Show audio levels in status bar to help with troubleshooting
+                    if max_level > 0.5:  # Only show for significant sound
+                        if hasattr(self.stt, "in_speech") and self.stt.in_speech:
+                            self.statusBar().showMessage(f"Audio: {max_level:.2f} - Speaking detected")
+                        else:
+                            self.statusBar().showMessage(f"Audio: {max_level:.2f}")
 
     def toggle_whisper_mode(self):
         """Toggle between whisper and normal detection modes"""
@@ -1350,6 +1472,43 @@ class MainWindow(QMainWindow):
             self.stt.toggle_whisper_mode(False)
             self.whisper_mode_button.setText("Whisper Mode: OFF")
             self.status_display.setText("Normal speech mode enabled")
+
+    def start_assistant(self):
+        """Start the speech assistant"""
+        # Get selected model
+        model_name = self.model_combo.currentText()
+        
+        if not model_name:
+            self.status_display.setText("Please select a model")
+            return
+        
+        # Disable UI elements
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.refresh_button.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        
+        # Create and start worker
+        self.speech_worker = SpeechWorker(self.stt, self.tts, self.ollama_client, model_name)
+        
+        # Connect signals
+        self.speech_worker.update_signal.connect(self.update_from_worker)
+        self.speech_worker.finished_signal.connect(self.worker_finished)
+        
+        # Instead, connect the existing signals from speech_worker:
+        self.speech_worker.stt_audio_signal.connect(self.input_visualizer.update_samples)
+        self.speech_worker.tts_audio_signal.connect(self.output_visualizer.update_samples)
+        
+        # Start the worker
+        self.speech_worker.start()
+        
+        if self.debug_mode:
+            print("\n=== DEBUG INFO ===")
+            print(f"Wake word: '{self.stt.wake_word}'")
+            print(f"Using model: {model_name}")
+            print(f"Whisper mode: {'ON' if hasattr(self.stt, 'whisper_mode') and self.stt.whisper_mode else 'OFF'}")
+            print(f"Current threshold: {self.stt.current_threshold}")
+            print("=================\n")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

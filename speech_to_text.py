@@ -28,7 +28,7 @@ class SpeechToText:
     - Automatic speech chunking
     """
     
-    def __init__(self, wake_word="Project 42"):
+    def __init__(self, wake_word="Eddie"):
         """
         Initialize speech recognition manager
         
@@ -74,6 +74,12 @@ class SpeechToText:
         self.normal_threshold = 550   # Regular threshold
         self.current_threshold = self.normal_threshold
         self.samples_buffer = []      # Buffer for audio visualization
+
+        # Add this line:
+        self.current_partial_result = ""
+        
+        # Add support for partial results
+        self.partial_results_enabled = True
         
     def listen(self, threshold=None, silence_duration=0.8, non_blocking=False, max_listen_time=5):
         """
@@ -128,10 +134,11 @@ class SpeechToText:
                 # Calculate RMS to detect silence
                 rms = audioop.rms(data, 2)
                 
-                # Store RMS for visualization
-                self.samples_buffer.append(rms / 1000.0)  # Normalize for visualization
+                # Store RMS for visualization - MAKE SURE THIS IS WORKING
+                sample_value = rms / 1000.0  # Normalize for visualization
+                self.samples_buffer.append(sample_value)  
                 if len(self.samples_buffer) > 100:
-                    self.samples_buffer = self.samples_buffer[-100:]
+                    self.samples_buffer = self.samples_buffer[-100:]  # Keep last 100 samples
                 
                 # Update dynamic threshold based on ambient noise
                 dynamic_threshold = self.update_silence_threshold(rms)
@@ -152,6 +159,11 @@ class SpeechToText:
                     silent_frames = 0
                     sound_detected = True
                     speech_duration = time.time() - self.speech_start_time
+                    
+                    # Add this section for live transcription:
+                    if len(frames) % 10 == 0 and len(frames) > 20 and self.partial_results_enabled:
+                        # Every 10 frames, try to get a partial transcription
+                        self.update_partial_result(frames)
                 else:
                     # Silence detected
                     silent_frames += 1
@@ -217,46 +229,22 @@ class SpeechToText:
     def recognize_speech(self, audio_file):
         """
         Recognize speech from audio file with improved error handling
-        
-        Args:
-            audio_file (str): Path to audio file
-            
-        Returns:
-            str: Recognized text or error message
         """
         if not audio_file:
             return ""
-            
+        
         try:
             with sr.AudioFile(audio_file) as source:
-                # Adjust for ambient noise for better recognition
-                # self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio_data = self.recognizer.record(source)
                 
             # Try to recognize with Google Speech API
             result = self.recognizer.recognize_google(audio_data)
-            print(f"Recognized: {result}")
+            print(f"Recognized text: '{result}'")  # Add clear debug output
             return result
             
         except sr.UnknownValueError:
-            print("Could not understand audio")
+            print("RECOGNITION ERROR: Could not understand audio")
             return "Sorry, I couldn't understand what you said."
-            
-        except sr.RequestError as e:
-            print(f"API request error: {e}")
-            return f"Could not request results; {e}"
-            
-        except Exception as e:
-            print(f"Recognition error: {e}")
-            return f"Error recognizing speech: {str(e)}"
-            
-        finally:
-            # Cleanup temp file
-            try:
-                if os.path.exists(audio_file):
-                    os.remove(audio_file)
-            except:
-                pass
 
     def wait_for_wake_word(self):
         """
@@ -430,11 +418,105 @@ class SpeechToText:
         return self.whisper_mode
 
     def get_audio_samples(self):
+        """Return audio samples for visualization"""
+        if len(self.samples_buffer) > 0:
+            return np.array(self.samples_buffer)
+        return np.zeros(100)
+
+    def update_partial_result(self, frames):
+        """Attempt to get partial transcription from current audio buffer"""
+        try:
+            # Save frames to a temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+            audio = pyaudio.PyAudio()
+            
+            with wave.open(temp_file.name, 'wb') as wf:
+                wf.setnchannels(self.CHANNELS)
+                wf.setsampwidth(audio.get_sample_size(self.FORMAT))
+                wf.setframerate(self.RATE)
+                wf.writeframes(b''.join(frames[-50:]))  # Use last second of audio
+                    
+            audio.terminate()
+            
+            # Try to recognize the speech
+            with sr.AudioFile(temp_file.name) as source:
+                audio_data = self.recognizer.record(source)
+                
+            try:
+                result = self.recognizer.recognize_google(audio_data)
+                if result:
+                    self.current_partial_result = result
+                    print(f"Partial result: {result}")
+            except sr.UnknownValueError:
+                # No recognizable speech
+                pass
+            except sr.RequestError:
+                # API error
+                pass
+            finally:
+                # Clean up temp file
+                try:
+                    os.remove(temp_file.name)
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error getting partial result: {e}")
+
+class SpeechWorker:
+    def __init__(self, stt):
+        self.stt = stt
+        self.live_listening_active = False
+
+    def run(self):
+        # Listen for user speech
+        self.update_signal.emit("status", "Listening...")
+
+        # Start listening but show interim results
+        self.live_listening_active = True
+        self.stt.partial_results_enabled = True  # Enable partial results
+
+        # Start background listening thread to show live results
+        live_thread = threading.Thread(target=self.live_transcription_preview)
+        live_thread.daemon = True
+        live_thread.start()
+
+        # Do the actual listening
+        speech_text = self.stt.start_listening_session(non_blocking=False)
+
+        # Stop live preview
+        self.live_listening_active = False
+        self.stt.partial_results_enabled = False  # Disable partial results
+
+class MainWindow:
+    def update_from_worker(self, update_type, content):
         """
-        Get current audio samples for visualization
+        Update the UI based on worker signals
         
-        Returns:
-            list: List of audio sample levels
+        Args:
+            update_type (str): Type of update (e.g., 'status', 'transcript', 'partial_transcript')
+            content (str): Content of the update
         """
-        # Return a copy of the current samples buffer
-        return np.array(self.samples_buffer)
+        if update_type == "status":
+            self.status_display.setText(content)
+        elif update_type == "transcript":
+            self.output_display.append(content)
+        elif update_type == "partial_transcript":
+            # Show partial transcript in status bar with different style
+            self.status_display.setText(f"Recognizing: {content}")
+            self.statusBar().showMessage(f"Hearing: {content}", 2000)
+            
+            # Also add it to the output display with distinguishing style
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            partial_html = f"<p><span style='color: #AAAAAA;'>[{timestamp}] Recognizing:</span> <i>{content}</i></p>"
+            
+            # Update or add partial text
+            current_html = self.output_display.toHtml()
+            if "Recognizing:</span>" in current_html:
+                # Replace existing partial text
+                parts = current_html.split("Recognizing:</span>")
+                before = parts[0] + "Recognizing:</span>"
+                after = parts[1].split("</p>", 1)[1] if "</p>" in parts[1] else ""
+                self.output_display.setHtml(before + f" <i>{content}</i></p>" + after)
+            else:
+                # Add new partial text
+                self.output_display.append(partial_html)

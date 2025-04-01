@@ -450,29 +450,14 @@ class TextToSpeech:
         }
     
     def get_audio_samples(self):
-        """
-        Get current audio samples for visualization
+        """Return audio samples for visualization"""
+        if not self.is_playing:
+            return np.zeros(100)
         
-        Returns:
-            numpy.ndarray: Array of audio sample levels
-        """
-        if pygame.mixer.music.get_busy():
-            # If audio is playing, generate some visualization data
-            # Based on how far along the playback is
-            pos = pygame.mixer.music.get_pos() / 1000.0  # Position in seconds
-            
-            # Generate some samples that look like they're related to the audio
-            # This is a simplification since we don't have direct access to the audio data
-            samples = np.zeros(100)
-            
-            # Create a pseudo-random but consistent pattern based on playback position
-            if pos > 0:
-                freq = (pos * 5) % 10 + 1  # Varies the frequency
-                x = np.linspace(0, freq * np.pi, 100)
-                volume = 0.6 + 0.4 * (0.5 + 0.5 * np.sin(pos * 0.5))  # 0.6-1.0 varying amplitude
-                samples = np.sin(x) * volume * 0.8 + np.random.random(100) * 0.2 * volume
-            
-            return samples
-        else:
-            # Return empty/minimal samples if not playing
-            return np.random.random(100) * 0.05
+        # Return the current audio samples if available
+        if hasattr(self, "visualizer_samples") and len(self.visualizer_samples) > 0:
+            return np.array(self.visualizer_samples)
+        
+        # Fill visualizer_samples with simulated audio when nothing else is available
+        self.visualizer_samples = np.sin(np.linspace(0, 3*np.pi, 100)) * 0.5 * self.is_playing
+        return self.visualizer_samples
