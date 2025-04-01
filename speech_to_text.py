@@ -487,6 +487,14 @@ class SpeechWorker:
         self.live_listening_active = False
         self.stt.partial_results_enabled = False  # Disable partial results
 
+        wake_word_detected = self.stt.wait_for_wake_word()
+        if wake_word_detected:
+            self.in_conversation = True
+            # Update UI with clear wake word detection message
+            self.update_signal.emit("status", "Wake word detected! I'm listening...")
+            # Add visual feedback
+            self.update_signal.emit("wake_word_detected", True)
+
 class MainWindow:
     def update_from_worker(self, update_type, content):
         """
@@ -520,3 +528,24 @@ class MainWindow:
             else:
                 # Add new partial text
                 self.output_display.append(partial_html)
+
+class AudioWaveformVisualizer:
+    def __init__(self, parent=None, mode="input", show_settings=True):
+        # Existing initialization...
+        
+        # Change this line to use the parameter
+        self.show_settings_button = show_settings
+
+# In MainWindow.init_ui where you create the visualizers
+# Create input visualizer with settings button
+self.input_visualizer = AudioWaveformVisualizer(mode="input", show_settings=False)  # No settings here
+self.input_visualizer.setMinimumHeight(80)
+visualizer_container.addWidget(self.input_visualizer)
+
+# Create output visualizer without settings button (or the reverse if you prefer)
+self.output_visualizer = AudioWaveformVisualizer(mode="output", show_settings=True)  # Only show settings here
+self.output_visualizer.setMinimumHeight(80)
+visualizer_container.addWidget(self.output_visualizer)
+
+# In the MainWindow.init_ui method, add clear wake word indicator
+self.statusBar().showMessage(f"Say wake word: '{self.stt.wake_word}' to begin")
