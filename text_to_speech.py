@@ -461,3 +461,140 @@ class TextToSpeech:
         # Fill visualizer_samples with simulated audio when nothing else is available
         self.visualizer_samples = np.sin(np.linspace(0, 3*np.pi, 100)) * 0.5 * self.is_playing
         return self.visualizer_samples
+
+    def set_output_device(self, device_index, volume=0.8):
+        """Set the output device for TTS playback
+        
+        Args:
+            device_index: PyAudio device index for output
+            volume: Volume level from 0.0 to 1.0
+        """
+        self.output_device_index = device_index
+        self.output_volume = volume
+        
+        try:
+            # Update pygame mixer if that's what you're using
+            import pygame
+            pygame.mixer.quit()
+            pygame.mixer.init(devicename=device_index)
+            pygame.mixer.music.set_volume(volume)
+            print(f"TTS output device set to {device_index} with volume {volume}")
+        except Exception as e:
+            print(f"Error setting TTS output device: {e}")
+
+    def setup_continuous_mode(self):
+        """Setup continuous conversation mode without wake word"""
+        # Set continuous mode flag
+        self.continuous_mode = True
+        self.in_conversation = True
+        
+        # Start listening immediately in a separate thread
+        threading.Thread(target=self.continuous_listening_loop, daemon=True).start()
+        
+    def continuous_listening_loop(self):
+        """Continuous listening loop that doesn't require wake word"""
+        self.update_signal.emit("status", "Continuous mode: I'm listening...")
+        
+        while self.running and hasattr(self, "continuous_mode") and self.continuous_mode:
+            # Only listen if not currently processing a response
+            if not self.thinking:
+                # Start listening with live transcription
+                self.live_listening_active = True
+                
+                # Start background thread for live results
+                live_thread = threading.Thread(target=self.live_transcription_preview)
+                live_thread.daemon = True
+                live_thread.start()
+                
+                # Listen for speech
+                speech_text = self.stt.start_listening_session(
+                    non_blocking=False,
+                    max_listen_time=10
+                )
+                
+                # Stop live preview
+                self.live_listening_active = False
+                
+                # Process speech if meaningful
+                if speech_text and len(speech_text.strip()) > 2:
+                    self.update_signal.emit("user", speech_text)
+                    self.process_speech_input(speech_text)
+                
+            # Small pause to prevent CPU overutilization
+            time.sleep(0.5)
+
+# Modify SpeechWorker.run method to handle continuous mode
+
+def run(self):
+    """Main worker loop for speech interaction with enhanced TTS"""
+    # Set default attributes
+    self.continuous_mode = False
+    self.push_to_talk_active = False
+    self.live_listening_active = False
+    
+    self.update_signal.emit("status", "Waiting for wake word or command...")
+    
+    # Start the interrupt listener thread
+    self.setup_interrupt_listener()
+    
+    while self.running:
+        # If continuous mode is enabled, skip wake word detection
+        if hasattr(self, "continuous_mode") and self.continuous_mode:
+            # Just check running state and sleep
+            time.sleep(0.5)
+            continue
+            
+        # Initial wake word to start conversation mode
+        if not self.in_conversation:
+            wake_word_detected = self.stt.wait_for_wake_word()
+            if wake_word_detected:
+                self.in_conversation = True
+                self.update_signal.emit("status", "Wake word detected! Listening...")
+            else:
+                # If we're not running anymore, exit
+                if not self.running:
+                    break
+                continue
+        
+        # In conversation mode: continuously listen and respond
+        while self.in_conversation and self.running:
+            # Listen for user speech
+            self.update_signal.emit("status", "Listening...")
+            
+            # Start listening with live transcription
+            self.live_listening_active = True
+            
+            # Start background thread for live results
+            live_thread = threading.Thread(target=self.live_transcription_preview)
+            live_thread.daemon = True
+            live_thread.start()
+            
+            # Listen for speech
+            speech_text = self.stt.start_listening_session(non_blocking=False)
+            
+            # Stop live preview
+            self.live_listening_active = False
+            
+            # Process recognized speech
+            if speech_text and speech_text.strip() != "":
+                # Check for exit command
+                if speech_text.lower().strip() in ["exit conversation", "exit", "quit", "stop conversation"]:
+                    self.in_conversation = False
+                    self.update_signal.emit("status", "Conversation ended. Say wake word to start again.")
+                    break
+                
+                # Update UI with recognized text
+                self.update_signal.emit("user", speech_text)
+                self.update_signal.emit("status", "Processing your request...")
+                
+                # Process speech
+                self.process_speech_input(speech_text)
+            else:
+                self.update_signal.emit("status", "Didn't catch that. Try again?")
+        
+        # Add this to emit input audio samples periodically
+        if hasattr(self, "stt") and hasattr(self.stt, "samples_buffer") and len(self.stt.samples_buffer) > 0:
+            input_samples = np.array(self.stt.samples_buffer)
+            self.stt_audio_signal.emit(input_samples)
+    
+    self.finished_signal.emit()

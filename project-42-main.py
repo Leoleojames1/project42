@@ -43,13 +43,15 @@ import speech_recognition as sr
 # Google Text-to-Speech TTS
 from gtts import gTTS
 
+from PyQt6 import sip
+
 # PyQt6 imports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QPushButton, QComboBox, QLabel, 
                            QTextEdit, QTabWidget, QSplitter, QTableWidget, 
                            QTableWidgetItem, QHeaderView, QScrollArea, QFrame,
                            QDialog, QFileDialog, QListWidget, QListWidgetItem,
-                           QMessageBox, QMenu, QInputDialog)
+                           QMessageBox, QMenu, QInputDialog, QLineEdit, QProgressBar, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl
 from PyQt6.QtGui import QColor, QPalette, QFont, QIcon, QAction
 
@@ -59,6 +61,9 @@ from text_to_speech import TextToSpeech
 
 # First, add the import for our new component
 from audio_visualizer import AudioWaveformVisualizer
+
+# Add this import near the top with your other imports
+from conversation_manager import ConversationManager
 
 class StyleSheet:
     """Style constants for dark theme UI"""
@@ -548,15 +553,15 @@ class SpeechWorker(QThread):
                 # Listen for user speech
                 self.update_signal.emit("status", "Listening...")
                 
-                # Start listening but show interim results
+                # Start listening with live transcription
                 self.live_listening_active = True
                 
-                # Start background listening thread to show live results
+                # Start background thread for live results
                 live_thread = threading.Thread(target=self.live_transcription_preview)
                 live_thread.daemon = True
                 live_thread.start()
                 
-                # Do the actual listening
+                # Listen for speech
                 speech_text = self.stt.start_listening_session(non_blocking=False)
                 
                 # Stop live preview
@@ -745,13 +750,90 @@ class SpeechWorker(QThread):
         status_message = f"Speaking: {text[:30]}..."
         self.update_signal.emit("status", status_message)
 
+    # Fix in SpeechWorker.live_transcription_preview
     def live_transcription_preview(self):
         """Show live transcription preview as audio is processed"""
-        while self.live_listening_active and hasattr(self.stt, "current_partial_result"):
-            if hasattr(self.stt, "current_partial_result") and self.stt.current_partial_result:
-                # Send partial result to UI
-                self.update_signal.emit("partial_transcript", self.stt.current_partial_result)
-            time.sleep(0.1)
+        last_result = ""
+        print("Starting live transcription preview")
+        while self.live_listening_active:
+            try:
+                if hasattr(self.stt, "current_partial_result") and self.stt.current_partial_result:
+                    # Only emit when the result changes
+                    current = self.stt.current_partial_result
+                    if current and current != last_result:
+                        self.update_signal.emit("partial_transcript", current)
+                        last_result = current
+                        print(f"Live transcript: {current}")
+            except Exception as e:
+                print(f"Error in live transcription: {e}")
+            time.sleep(0.2)  # Reduced polling frequency
+        print("Live transcription preview stopped")
+
+    # Add to SpeechWorker class
+    def start_push_to_talk_listening(self):
+        """Start direct listening bypassing wake word"""
+        def listen_and_process():
+            # Show active listening status
+            self.update_signal.emit("status", "Listening (Push to Talk)...")
+            
+            # Start listening with live transcription
+            self.live_listening_active = True
+            
+            # Start background thread for live results
+            live_thread = threading.Thread(target=self.live_transcription_preview)
+            live_thread.daemon = True
+            live_thread.start()
+            
+            # Listen until push-to-talk button released or max duration
+            speech_text = self.stt.start_listening_session(
+                non_blocking=False,
+                max_listen_time=10,  # Longer timeout for push-to-talk
+                wait_for_release=True,  # Will stop when push_to_talk_active becomes False
+            )
+            
+            # Stop live preview
+            self.live_listening_active = False
+            
+            # Process speech if we got something
+            if speech_text and speech_text.strip():
+                self.update_signal.emit("user", speech_text)
+                self.process_speech_input(speech_text)
+            else:
+                self.update_signal.emit("status", "No speech detected")
+        
+        # Run in background thread
+        threading.Thread(target=listen_and_process, daemon=True).start()
+
+    def process_speech_input(self, speech_text):
+        """Process recognized speech input"""
+        self.update_signal.emit("status", "Processing your request...")
+        
+        # Start thinking mode
+        self.thinking = True
+        
+        try:
+            # Prepare messages for LLM
+            messages = self.ollama_client.get_conversation_messages()
+            messages.append({"role": "user", "content": speech_text})
+            
+            # Generate LLM response with streaming
+            self.update_signal.emit("status", "Assistant is thinking...")
+            self.response_buffer = ""
+            
+            # Get streaming response
+            stream = self.ollama_client.chat(
+                self.model_name,
+                messages,
+                stream=True
+            )
+            
+            # Process streaming chunks with visualization
+            self.process_llm_response(stream)
+            
+        except Exception as e:
+            self.update_signal.emit("error", f"Error generating response: {str(e)}")
+        finally:
+            self.thinking = False
 
 
 class MainWindow(QMainWindow):
@@ -764,11 +846,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Project 42 - Speech Assistant")
         self.resize(1200, 800)
         
+        # Set debug mode BEFORE initializing UI
+        self.debug_mode = True  # Set to False in production
+        
         # Initialize components
         self.stt = SpeechToText()
         self.tts = TextToSpeech()
         self.ollama_client = OllamaClient()
-        self.conversation_manager = ConversationManager()
+        self.conversation_manager = ConversationManager(storage_path="conversations")
+        
+        # Default audio settings
+        self.input_device_index = None
+        self.input_gain = 1.0
         
         # Initialize UI
         self.init_ui()
@@ -776,19 +865,15 @@ class MainWindow(QMainWindow):
         # Apply dark theme
         self.setStyleSheet(StyleSheet.DARK_THEME)
         
+        # Load audio settings BEFORE refreshing models
+        self.load_audio_settings()
+        
         # Show available models
         self.refresh_models()
         
         # Load conversations
         self.load_conversation_list()
         
-        self.debug_mode = True  # Set to False in production
-        
-    def init_ui(self):
-        """Initialize UI components"""
-        # Create central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
         
         # Main layout
         main_layout = QVBoxLayout(central_widget)
@@ -1013,7 +1098,117 @@ class MainWindow(QMainWindow):
             self.visualizer_timer = QTimer(self)
             self.visualizer_timer.timeout.connect(self.update_visualizers)
             self.visualizer_timer.start(50)  # Update every 50ms
+
+        # After creating control panel, add this:
         
+        # Wake word controls panel
+        wake_word_panel = QWidget()
+        wake_word_layout = QHBoxLayout(wake_word_panel)
+        
+        # Wake word input
+        wake_label = QLabel("Wake Word:")
+        self.wake_word_input = QLineEdit(self.stt.wake_word)
+        self.wake_word_input.setMaximumWidth(120)
+        self.wake_word_input.returnPressed.connect(self.update_wake_word)
+        
+        # Apply button
+        self.apply_wake_button = QPushButton("Apply")
+        self.apply_wake_button.clicked.connect(self.update_wake_word)
+        
+        # Wake word enable toggle
+        self.wake_word_toggle = QPushButton("Wake Word: ON")
+        self.wake_word_toggle.setCheckable(True)
+        self.wake_word_toggle.setChecked(True)
+        self.wake_word_toggle.clicked.connect(self.toggle_wake_word)
+        
+        # Push-to-talk button
+        self.push_to_talk = QPushButton("Push to Talk")
+        self.push_to_talk.setToolTip("Hold to speak without wake word")
+        self.push_to_talk.pressed.connect(self.start_push_to_talk)
+        self.push_to_talk.released.connect(self.stop_push_to_talk)
+        
+        # Add to layout
+        wake_word_layout.addWidget(wake_label)
+        wake_word_layout.addWidget(self.wake_word_input)
+        wake_word_layout.addWidget(self.apply_wake_button)
+        wake_word_layout.addWidget(self.wake_word_toggle)
+        wake_word_layout.addWidget(self.push_to_talk)
+        
+        # Add to main layout (after control panel)
+        main_layout.addWidget(wake_word_panel)
+        
+        # Add to MainWindow.init_ui after audio visualizer setup
+        # Add audio level meter
+        level_meter_panel = QWidget()
+        level_meter_layout = QHBoxLayout(level_meter_panel)
+
+        # Current threshold indicator
+        self.threshold_label = QLabel("Threshold: 550")
+        level_meter_layout.addWidget(self.threshold_label)
+
+        # Audio level meter
+        self.level_meter = QProgressBar()
+        self.level_meter.setMinimum(0)
+        self.level_meter.setMaximum(1000)
+        self.level_meter.setFormat("Input Level: %v")
+        self.level_meter.setTextVisible(True)
+        self.level_meter.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 5px;
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #375e9e, stop:0.5 #376e9e, stop:1 #5e9c37);
+                border-radius: 5px;
+            }
+        """)
+        level_meter_layout.addWidget(self.level_meter, 1)  # 1 = stretch factor
+
+        # Threshold adjustment
+        thresh_down_btn = QPushButton("-")
+        thresh_down_btn.setFixedSize(30, 30)
+        thresh_down_btn.clicked.connect(self.decrease_threshold)
+        level_meter_layout.addWidget(thresh_down_btn)
+
+        thresh_up_btn = QPushButton("+")
+        thresh_up_btn.setFixedSize(30, 30)
+        thresh_up_btn.clicked.connect(self.increase_threshold)
+        level_meter_layout.addWidget(thresh_up_btn)
+
+        # Add to main layout
+        main_layout.addWidget(level_meter_panel)
+        
+        # Add this to MainWindow.init_ui after tabs setup
+
+        # Add Debug tab
+        self.debug_tab = QWidget()
+        debug_layout = QVBoxLayout(self.debug_tab)
+
+        # Debug output
+        self.debug_output = QTextEdit()
+        self.debug_output.setReadOnly(True)
+        debug_layout.addWidget(QLabel("Debug Log:"))
+        debug_layout.addWidget(self.debug_output)
+
+        # Debug controls
+        debug_control_layout = QHBoxLayout()
+        self.debug_checkbox = QCheckBox("Enable Debug Mode")
+        self.debug_checkbox.setChecked(self.debug_mode)
+        self.debug_checkbox.toggled.connect(self.toggle_debug_mode)
+
+        self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.clicked.connect(self.debug_output.clear)
+
+        debug_control_layout.addWidget(self.debug_checkbox)
+        debug_control_layout.addWidget(self.clear_log_button)
+        debug_layout.addLayout(debug_control_layout)
+
+        # Add debug tab to left panel
+        left_panel.addTab(self.debug_tab, "Debug")
+
     def refresh_models(self):
         """Refresh available Ollama models"""
         self.model_combo.clear()
@@ -1418,7 +1613,6 @@ class MainWindow(QMainWindow):
             # Process next sentence while current one is playing
             audio_futures.append(self.executor.submit(self.generate_sentence_audio, sentence))
 
-    # Fix in update_visualizers method
     def update_visualizers(self):
         """Update audio visualizers with latest samples"""
         # If speech worker is active and we have a speech-to-text instance
@@ -1429,12 +1623,19 @@ class MainWindow(QMainWindow):
                 if len(input_samples) > 0:
                     self.input_visualizer.update_samples(input_samples)
                     
+                    # Update level meter
+                    avg_level = np.mean(input_samples)
+                    self.update_level_meter(avg_level)
+                    
                     # Show recognized speech status in real time
                     if hasattr(self.stt, "in_speech") and self.stt.in_speech:
-                        avg_level = np.mean(input_samples)
                         if avg_level > 0.1:  # Only show for significant sound
                             self.status_display.setText("Listening: Speech detected...")
-        
+                            
+                            # Add rms value to debug if enabled
+                            if self.debug_mode and hasattr(self.stt, "last_rms"):
+                                self.add_debug_log(f"RMS: {self.stt.last_rms}, Threshold: {self.stt.current_threshold}")
+    
         # If we have text-to-speech instance
         if hasattr(self, "tts") and self.tts:
             # Get audio samples from TTS
@@ -1446,21 +1647,6 @@ class MainWindow(QMainWindow):
                     # Show TTS active status
                     if self.tts.is_playing:
                         self.status_display.setText("Speaking...")
-
-        # Add detailed status display 
-        if hasattr(self, "stt") and self.stt:
-            if hasattr(self.stt, "samples_buffer"):  # Fixed attribute check
-                samples_buffer = self.stt.samples_buffer
-                if len(samples_buffer) > 0:
-                    avg_level = np.mean(samples_buffer)
-                    max_level = np.max(samples_buffer) if len(samples_buffer) > 0 else 0
-                    
-                    # Show audio levels in status bar to help with troubleshooting
-                    if max_level > 0.5:  # Only show for significant sound
-                        if hasattr(self.stt, "in_speech") and self.stt.in_speech:
-                            self.statusBar().showMessage(f"Audio: {max_level:.2f} - Speaking detected")
-                        else:
-                            self.statusBar().showMessage(f"Audio: {max_level:.2f}")
 
     def toggle_whisper_mode(self):
         """Toggle between whisper and normal detection modes"""
@@ -1494,24 +1680,295 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.speech_worker.update_signal.connect(self.update_from_worker)
         self.speech_worker.finished_signal.connect(self.worker_finished)
-        
-        # Instead, connect the existing signals from speech_worker:
         self.speech_worker.stt_audio_signal.connect(self.input_visualizer.update_samples)
         self.speech_worker.tts_audio_signal.connect(self.output_visualizer.update_samples)
+        
+        # Check if continuous mode is enabled
+        continuous_mode = self.continuous_mode_button.isChecked() if hasattr(self, "continuous_mode_button") else False
         
         # Start the worker
         self.speech_worker.start()
         
+        # Enable continuous mode if needed
+        if continuous_mode:
+            # Let the thread start first
+            QTimer.singleShot(500, self.speech_worker.setup_continuous_mode)
+            self.status_display.setText("Starting continuous conversation mode...")
+        
+        # Debug info
         if self.debug_mode:
             print("\n=== DEBUG INFO ===")
             print(f"Wake word: '{self.stt.wake_word}'")
             print(f"Using model: {model_name}")
             print(f"Whisper mode: {'ON' if hasattr(self.stt, 'whisper_mode') and self.stt.whisper_mode else 'OFF'}")
             print(f"Current threshold: {self.stt.current_threshold}")
+            print(f"Continuous mode: {'ON' if continuous_mode else 'OFF'}")
             print("=================\n")
+
+    # Enable query interface (add this in the MainWindow class)
+    def show_memory_query_dialog(self):
+        """Show dialog for querying conversation memory using natural language"""
+        query, ok = QInputDialog.getText(
+            self,
+            "Memory Query",
+            "Enter your question about conversation history:",
+            text="Show me conversations about weather"
+        )
+        
+        if ok and query:
+            self.status_display.setText(f"Querying memory: {query}")
+            
+            # Run query
+            result = self.conversation_manager.search_memory(query)
+            
+            if self.conversation_manager.query_engine:
+                # Show the result in a dialog if using the query engine
+                dialog = QDialog(self)
+                dialog.setWindowTitle("Memory Query Result")
+                dialog.setMinimumSize(600, 400)
+                
+                layout = QVBoxLayout(dialog)
+                
+                # Query text
+                query_label = QLabel(f"<b>Query:</b> {query}")
+                layout.addWidget(query_label)
+                
+                # Result
+                result_text = QTextEdit()
+                result_text.setReadOnly(True)
+                
+                if isinstance(result, dict) and 'response' in result:
+                    result_text.setText(result['response'])
+                    
+                    # Show pandas code if available
+                    if 'code' in result:
+                        result_text.append(f"\n\n<b>Pandas code:</b>\n{result['code']}")
+                else:
+                    # Format the results
+                    result_text.setText(f"Found {len(result)} matching messages:\n\n")
+                    
+                    for item in result[:20]:  # Limit to 20
+                        timestamp = item.get('timestamp', 'Unknown')
+                        source = item.get('source', 'Unknown')
+                        content = item.get('content', '')
+                        
+                        result_text.append(f"[{timestamp}] <b>{source}:</b> {content}\n")
+                        
+                    if len(result) > 20:
+                        result_text.append(f"\n... and {len(result) - 20} more results")
+                        
+                layout.addWidget(result_text)
+                
+                # Close button
+                close_button = QPushButton("Close")
+                close_button.clicked.connect(dialog.accept)
+                layout.addWidget(close_button)
+                
+                dialog.exec()
+            else:
+                # Use standard table display without query engine
+                self.memory_tab.setCurrentIndex(1)  # Switch to memory tab
+                self.load_memory_search_results(result)
+                
+    # Add this method to the memory tab (add a button)
+    def add_memory_query_button(self):
+        """Add a natural language query button to memory tab"""
+        # In your init_ui method, add this to the memory_layout:
+        nl_query_button = QPushButton("Natural Language Query")
+        nl_query_button.setToolTip("Query memory using natural language")
+        nl_query_button.clicked.connect(self.show_memory_query_dialog)
+        memory_layout.addWidget(nl_query_button)
+
+    def update_wake_word(self):
+        """Update wake word from input field"""
+        new_word = self.wake_word_input.text().strip()
+        if new_word:
+            self.stt.set_wake_word(new_word)
+            self.statusBar().showMessage(f"Wake word set to: '{new_word}'", 3000)
+            self.status_display.setText(f"Wake word set to: '{new_word}'")
+
+    def toggle_wake_word(self):
+        """Enable or disable wake word detection"""
+        if self.wake_word_toggle.isChecked():
+            self.stt.wake_word_enabled = True
+            self.wake_word_toggle.setText("Wake Word: ON")
+            self.statusBar().showMessage("Wake word detection enabled", 3000)
+        else:
+            self.stt.wake_word_enabled = False
+            self.wake_word_toggle.setText("Wake Word: OFF") 
+            self.statusBar().showMessage("Wake word detection disabled - Push to Talk only", 3000)
+
+    def start_push_to_talk(self):
+        """Start push-to-talk listening"""
+        if self.speech_worker:
+            self.speech_worker.push_to_talk_active = True
+            self.speech_worker.start_push_to_talk_listening()
+            self.status_display.setText("Listening (Push to Talk)...")
+
+    def stop_push_to_talk(self):
+        """Stop push-to-talk listening"""
+        if self.speech_worker:
+            self.speech_worker.push_to_talk_active = False
+            self.status_display.setText("Processing...")
+
+    def update_level_meter(self, level):
+        """Update audio level meter with current input level"""
+        meter_value = int(level * 1000)
+        self.level_meter.setValue(meter_value)
+        
+        # Change color based on threshold
+        if self.stt and hasattr(self.stt, "current_threshold"):
+            threshold = int(self.stt.current_threshold)
+            if meter_value > threshold:
+                self.level_meter.setStyleSheet("""
+                    QProgressBar::chunk { background-color: #5e9c37; }
+                """)
+            else:
+                self.level_meter.setStyleSheet("""
+                    QProgressBar::chunk { background-color: #376e9e; }
+                """)
+
+    def increase_threshold(self):
+        """Increase speech detection threshold"""
+        if self.stt:
+            self.stt.current_threshold += 50
+            self.threshold_label.setText(f"Threshold: {int(self.stt.current_threshold)}")
+            self.statusBar().showMessage(f"Speech threshold increased to {int(self.stt.current_threshold)}", 2000)
+
+    def decrease_threshold(self):
+        """Decrease speech detection threshold"""
+        if self.stt:
+            self.stt.current_threshold = max(100, self.stt.current_threshold - 50)
+            self.threshold_label.setText(f"Threshold: {int(self.stt.current_threshold)}")
+            self.statusBar().showMessage(f"Speech threshold decreased to {int(self.stt.current_threshold)}", 2000)
+
+    # Add this method to MainWindow
+    def add_debug_log(self, message):
+        """Add message to debug log with timestamp"""
+        if self.debug_mode:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.debug_output.append(f"[{timestamp}] {message}")
+
+    def toggle_debug_mode(self, enabled):
+        """Toggle debug mode"""
+        self.debug_mode = enabled
+        if enabled:
+            self.add_debug_log("Debug mode enabled")
+        else:
+            self.add_debug_log("Debug mode disabled")
+
+    # Add this method to MainWindow class
+
+    def save_audio_settings(self):
+        """Save audio settings to a JSON file for persistence"""
+        import json
+        
+        settings = {
+            "input_device_index": self.input_device_index if hasattr(self, "input_device_index") else None,
+            "input_gain": self.input_gain if hasattr(self, "input_gain") else 1.0,
+            "threshold": self.stt.current_threshold if hasattr(self.stt, "current_threshold") else 550,
+            "whisper_mode": self.stt.whisper_mode if hasattr(self.stt, "whisper_mode") else False,
+            "wake_word": self.stt.wake_word,
+            "wake_word_enabled": self.stt.wake_word_enabled if hasattr(self.stt, "wake_word_enabled") else True
+        }
+        
+        try:
+            with open("audio_settings.json", "w") as f:
+                json.dump(settings, f)
+            self.add_debug_log("Audio settings saved")
+        except Exception as e:
+            self.add_debug_log(f"Error saving settings: {e}")
+
+    def load_audio_settings(self):
+        """Load audio settings from a JSON file"""
+        import json
+        import os
+        
+        if not os.path.exists("audio_settings.json"):
+            self.add_debug_log("No saved settings found")
+            return
+            
+        try:
+            with open("audio_settings.json", "r") as f:
+                settings = json.load(f)
+                
+            # Apply loaded settings
+            if "input_device_index" in settings and settings["input_device_index"] is not None:
+                self.input_device_index = settings["input_device_index"]
+                
+            if "input_gain" in settings:
+                self.input_gain = settings["input_gain"]
+                
+            if "threshold" in settings and hasattr(self.stt, "current_threshold"):
+                self.stt.current_threshold = settings["threshold"]
+                self.threshold_label.setText(f"Threshold: {int(self.stt.current_threshold)}")
+                
+            if "whisper_mode" in settings and hasattr(self.stt, "whisper_mode"):
+                self.stt.toggle_whisper_mode(settings["whisper_mode"])
+                self.whisper_mode_button.setChecked(settings["whisper_mode"])
+                self.whisper_mode_button.setText(f"Whisper Mode: {'ON' if settings['whisper_mode'] else 'OFF'}")
+                
+            if "wake_word" in settings:
+                self.stt.set_wake_word(settings["wake_word"])
+                self.wake_word_input.setText(settings["wake_word"])
+                
+            if "wake_word_enabled" in settings:
+                self.stt.wake_word_enabled = settings["wake_word_enabled"]
+                self.wake_word_toggle.setChecked(settings["wake_word_enabled"])
+                self.wake_word_toggle.setText(f"Wake Word: {'ON' if settings['wake_word_enabled'] else 'OFF'}")
+                
+            self.add_debug_log("Audio settings loaded")
+        except Exception as e:
+            self.add_debug_log(f"Error loading settings: {e}")
+
+    def open_audio_settings(self):
+        """Open unified audio settings dialog"""
+        dialog = AudioSettingsDialog(self)
+        
+        # Pre-select current device if set
+        if hasattr(self, "input_device_index") and self.input_device_index is not None:
+            index = dialog.input_device_combo.findData(self.input_device_index)
+            if index >= 0:
+                dialog.input_device_combo.setCurrentIndex(index)
+        
+        # Set current gain
+        if hasattr(self, "input_gain"):
+            dialog.gain_slider.setValue(int(self.input_gain * 100))
+        
+        if dialog.exec():
+            # Apply settings if OK was clicked
+            device_index = dialog.input_device_combo.currentData()
+            gain_value = dialog.gain_slider.value() / 100.0
+            
+            # Log the change
+            print(f"Selected device: {device_index}, Gain: {gain_value}")
+            
+            # Save settings to instance
+            self.input_device_index = device_index
+            self.input_gain = gain_value
+            
+            # Apply to speech recognition component
+            if self.stt:
+                self.stt.input_device_index = device_index
+                self.stt.input_gain = gain_value
+                
+                # Apply changes immediately if possible
+                if hasattr(self.stt, "update_audio_device") and callable(self.stt.update_audio_device):
+                    self.stt.update_audio_device(device_index, gain_value)
+                
+                # Update threshold display if it exists
+                if hasattr(self, "threshold_label"):
+                    self.threshold_label.setText(f"Threshold: {int(self.stt.current_threshold)}")
+            
+            # Visual confirmation
+            self.status_display.setText(f"Audio settings updated: Device {device_index}, Gain {gain_value:.2f}")
+            
+            # Save settings to file
+            self.save_audio_settings()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    window.load_audio_settings()  # Load settings on startup
     sys.exit(app.exec())

@@ -28,18 +28,22 @@ class SpeechToText:
     - Automatic speech chunking
     """
     
-    def __init__(self, wake_word="Eddie"):
+    def __init__(self, wake_word="Eddie", input_device_index=None, input_gain=1.0):
         """
         Initialize speech recognition manager
         
         Args:
             wake_word (str): The wake word to activate the assistant
+            input_device_index (int, optional): PyAudio device index
+            input_gain (float): Input gain multiplier
         """
         # Core settings
         self.wake_word = wake_word
         self.is_listening = False
         self.is_active = True
         self.speech_interrupted = False
+        self.input_device_index = input_device_index
+        self.input_gain = input_gain
         
         # Initialize recognizer
         self.recognizer = sr.Recognizer()
@@ -227,9 +231,7 @@ class SpeechToText:
         return None
 
     def recognize_speech(self, audio_file):
-        """
-        Recognize speech from audio file with improved error handling
-        """
+        """Recognize speech from audio file with improved error handling"""
         if not audio_file:
             return ""
         
@@ -237,34 +239,84 @@ class SpeechToText:
             with sr.AudioFile(audio_file) as source:
                 audio_data = self.recognizer.record(source)
                 
+                # Add this line to adjust for potential quiet speech
+                if self.whisper_mode:
+                    audio_data = sr.AudioData(
+                        audio_data.frame_data,
+                        audio_data.sample_rate,
+                        audio_data.sample_width
+                    )
+                
             # Try to recognize with Google Speech API
-            result = self.recognizer.recognize_google(audio_data)
-            print(f"Recognized text: '{result}'")  # Add clear debug output
-            return result
-            
-        except sr.UnknownValueError:
-            print("RECOGNITION ERROR: Could not understand audio")
-            return "Sorry, I couldn't understand what you said."
+            try:
+                result = self.recognizer.recognize_google(audio_data)
+                print(f"Recognition successful: '{result}'")
+                return result
+            except sr.UnknownValueError:
+                print(f"Google couldn't understand audio - trying with lower threshold")
+                # Try again with modified energy threshold
+                self.recognizer.energy_threshold = 300
+                try:
+                    result = self.recognizer.recognize_google(audio_data)
+                    print(f"Second attempt successful: '{result}'")
+                    return result
+                except:
+                    print("RECOGNITION ERROR: Could not understand audio after retry")
+                    return "Sorry, I couldn't understand what you said."
+                
+        except Exception as e:
+            print(f"Error in speech recognition: {e}")
+            return "Sorry, there was an error processing the audio."
 
     def wait_for_wake_word(self):
         """
-        Wait for wake word activation
+        Wait for wake word activation with better reliability
         
         Returns:
             bool: True if wake word detected, False otherwise
         """
+        # Check if wake word is disabled
+        if hasattr(self, "wake_word_enabled") and self.wake_word_enabled is False:
+            # Skip wake word detection
+            print("Wake word detection disabled")
+            return True
+        
         print(f"Waiting for wake word: '{self.wake_word}'")
+        
+        # Lower threshold specifically for wake word detection
+        wake_word_threshold = self.current_threshold * 0.7  # More sensitive for wake word
+        
+        self.last_rms = 0  # Add tracking for latest RMS value
+        
         while self.is_active:
-            temp_file = self.listen()
+            temp_file = self.listen(threshold=wake_word_threshold)
             if temp_file:
-                speech_text = self.recognize_speech(temp_file).lower()
-                print(f"Heard: {speech_text}")
-                
-                if self.wake_word.lower() in speech_text:
-                    print("Wake word detected!")
-                    return True
-        return False
+                try:
+                    speech_text = self.recognize_speech(temp_file).lower()
+                    print(f"Heard: {speech_text}")
                     
+                    # More flexible wake word matching
+                    if self.wake_word.lower() in speech_text or self.wake_word.lower().replace(" ", "") in speech_text.replace(" ", ""):
+                        print("✓ Wake word detected!")
+                        return True
+                        
+                    # Also match first name only if wake word has multiple parts
+                    if " " in self.wake_word:
+                        first_part = self.wake_word.split(" ")[0].lower()
+                        if first_part in speech_text and len(first_part) > 2:  # Avoid matching short words
+                            print(f"✓ Partial wake word detected ({first_part})!")
+                            return True
+                except Exception as e:
+                    print(f"Error in wake word detection: {e}")
+                    
+            # Allow interruption
+            if self.speech_interrupted:
+                print("Wake word detection interrupted")
+                self.speech_interrupted = False
+                return False
+        
+        return False
+
     def start_listening_session(self, non_blocking=False):
         """
         Start a listening session, optionally in non-blocking mode
@@ -461,6 +513,35 @@ class SpeechToText:
                     pass
         except Exception as e:
             print(f"Error getting partial result: {e}")
+
+    def update_audio_device(self, device_index, gain=1.0):
+        """Update the audio device and gain settings
+        
+        Args:
+            device_index (int): PyAudio device index
+            gain (float): Input gain multiplier
+        """
+        self.input_device_index = device_index
+        self.input_gain = gain
+        print(f"STT: Updated audio device to {device_index} with gain {gain}")
+        
+        # If we're currently listening, restart with new device
+        was_active = self.is_active
+        
+        # Stop current stream if exists
+        if hasattr(self, "stream") and self.stream:
+            self.is_active = False
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+            
+            # Restart if needed
+            if was_active:
+                self.is_active = True
+                self.setup_audio_stream()
+                print("Restarted audio stream with new device")
+        
+        return True
 
 class SpeechWorker:
     def __init__(self, stt):
